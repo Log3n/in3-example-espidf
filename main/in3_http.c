@@ -42,8 +42,7 @@
 #include "esp_http_client.h"
 #include <esp_log.h>
 #include "freertos/task.h"
-
-
+#include "lwip/apps/sntp.h"
 
 #include <in3/client.h>   // the core client
 #include <in3/eth_api.h>  // functions for direct api-access
@@ -54,14 +53,24 @@
 #include <stdio.h>
 
 #include <in3/stringbuilder.h> // stringbuilder tool for dynamic memory string handling
+
+#include <in3-core/c/src/third-party/crypto/ecdsa.h>
+#include "in3-core/c/src/third-party/crypto/secp256k1.h"
+
 static const char *REST_TAG = "esp-rest";
 //buffer to receive data from in3 http transport
 static sb_t *http_in3_buffer = NULL;
 // in3 client
-static in3_t *c;    
+static in3_t *c;
 static const char *TAG = "IN3";
+
+static TaskHandle_t xTaskToNotify = NULL;
+static eth_tx_t *tx = NULL;
+
 // header for in3 setup
 void init_in3(void);
+void in3_register_eth_full(void);
+void in3_register_eth_basic(void);
 /**
  * ESP HTTP Client configuration and request
  * **/
@@ -131,34 +140,90 @@ void send_request(char *url, char *payload)
     }
 }
 
-
 /**
  * FreeRTOS Tasks
  * **/
 /* Freertos task for evm call requests */
-void in3_task_evm(void *pvParameters)
+void in3_task_verify(void *pvParameters)
 {
-    address_t contract;
-    // setup lock access contract address to be excuted with eth_call
-    hex_to_bytes("0x36643F8D17FE745a69A2Fd22188921Fade60a98B", -1, contract, 20);
-    //ask for the access to the lock
-    json_ctx_t *response = eth_call_fn(c, contract, BLKNUM(2707918), "hasAccess():bool");
-    if (!response){
-        ESP_LOGI(REST_TAG, "Could not get the response: %s", eth_last_error());
-    }
-    else{
-        // convert the response to a uint32_t,
-        uint8_t access = d_int(response->result);
-        ESP_LOGI(TAG, "Access granted? : %d \n", access);
+    int result;
 
-        // clean up resources
-        json_free(response);
-    }
-    
+    cJSON *bodyRoot = (cJSON *)pvParameters;
+    cJSON *json_signature = cJSON_GetObjectItemCaseSensitive(bodyRoot, "signature");
+    cJSON *json_pubKey = cJSON_GetObjectItemCaseSensitive(bodyRoot, "pubKey");
+
+    char *signature = cJSON_GetStringValue(json_signature);
+    char *pubKey = cJSON_GetStringValue(json_pubKey);
+
+    ESP_LOGI(TAG, "Post body pubKey: %s", pubKey);
+    ESP_LOGI(TAG, "Post body signature: %s", signature);
+
+    uint8_t *pub_key = malloc(65 * sizeof(char));
+    hex_to_bytes(pubKey, -1, pub_key, 65);
+
+    uint8_t *sig = malloc(65 * sizeof(char));
+    hex_to_bytes(signature, -1, sig, 64);
+
+    //uint8_t *msg = (uint8_t *)"{\"timestamp\":1598369310042,\"txHash\":\"0x09c244732eba5c87615b49ba9975203b76012e605834c3c67239ca5f2fb257b7\"}";
+    uint8_t *msg = (uint8_t *)"Test";
+
+    ESP_LOGI(TAG, "Post body signature: %s", msg);
+
+    // uint8_t hash[32];
+    // char *msg_hash = malloc(65 * sizeof(char));
+    // hasher_Raw(HASHER_SHA3K, msg, sizeof(msg), hash);
+    // bytes_to_hex(hash, sizeof(hash), msg_hash);
+    // ESP_LOGI(TAG, "Post body signature hash: 0x%s", msg_hash);
+    // free(msg_hash);
+
+    result = ecdsa_verify(&secp256k1, HASHER_SHA3K, pub_key, sig, msg, sizeof(msg));
+    ESP_LOGI(TAG, "verify result %d", result);
+
+    // notify and exit task
+    xTaskNotify(xTaskToNotify, result, eSetValueWithOverwrite);
+    xTaskToNotify = NULL;
+
+    // clean up resources
+    free(sig);
+    free((void *)pub_key);
+    //free(msg);
+
     vTaskDelete(NULL);
 }
 
-/* Freertos task for get block number requests */    
+void in3_task_get_tx(void *pvParameters)
+{
+
+    ESP_LOGI(TAG, "tx_hash: %s \n", (char *)pvParameters);
+
+    bytes32_t tx_hash;
+    uint8_t access = 0;
+    // tx hash
+    hex_to_bytes((char *)pvParameters, -1, tx_hash, 32); // kovan
+    // get tx by hash
+    tx = eth_getTransactionByHash(c, tx_hash);
+
+    if (!tx)
+    {
+        ESP_LOGI(REST_TAG, "Could not get the tx: %s", eth_last_error());
+    }
+    else
+    {
+        // convert the response to a uint32_t,
+        access = 1;
+        ESP_LOGI(TAG, "tx received : %d \n", access);
+    }
+
+    // notify and exit task
+    xTaskNotify(xTaskToNotify, access, eSetValueWithOverwrite);
+    xTaskToNotify = NULL;
+
+    // clean up resources
+    //free(tx);
+    vTaskDelete(NULL);
+}
+
+/* Freertos task for get block number requests */
 void in3_task_blk_number(void *pvParameters)
 {
     eth_block_t *block = eth_getBlockByNumber(c, BLKNUM(2707918), true);
@@ -172,22 +237,123 @@ void in3_task_blk_number(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-
 /**
  * Local ESP HTTP server 
  * **/
 /* GET endpoint /api/access rest handler for in3 request */
 static esp_err_t exec_get_handler(httpd_req_t *req)
 {
-    // trigger freertos task to process in3 calls and cache the result in 
-    xTaskCreate(in3_task_evm, "uTask", 28048, NULL, 7, NULL);
+    /* Destination buffer for content of HTTP POST request.
+     * httpd_req_recv() accepts char* only, but content could
+     * as well be any binary data (needs type casting).
+     * In case of string data, null termination will be absent, and
+     * content length would give length of string */
+    char content[1024];
+
+    /* Truncate if content length larger than the buffer */
+    // size_t recv_size = MIN(req->content_len, sizeof(content));
+
+    int ret = httpd_req_recv(req, content, sizeof(content));
+    if (ret <= 0)
+    { /* 0 return value indicates connection closed */
+        /* Check if timeout occurred */
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT)
+        {
+            /* In case of timeout one can choose to retry calling
+             * httpd_req_recv(), but to keep it simple, here we
+             * respond with an HTTP 408 (Request Timeout) error */
+            httpd_resp_send_408(req);
+        }
+        /* In case of error, returning ESP_FAIL will
+         * ensure that the underlying socket is closed */
+        return ESP_FAIL;
+    }
+
+    cJSON *bodyRoot = cJSON_Parse(content);
+    cJSON *json_tx_hash = cJSON_GetObjectItemCaseSensitive(bodyRoot, "tx_hash");
+    cJSON *json_timestamp = cJSON_GetObjectItemCaseSensitive(bodyRoot, "timestamp");
+    char *tx_hash = cJSON_GetStringValue(json_tx_hash);
+    char *timestamp = cJSON_GetStringValue(json_timestamp);
+    ESP_LOGI(TAG, "Post body tx_hash=%s", tx_hash);
+    ESP_LOGI(TAG, "Post body timestamp=%s", timestamp);
+    //ESP_LOGI(TAG, "Post body timestamp=%ld", strtol(timestamp, NULL, 0));
+
+    // verify
+    time_t now;
+    time(&now);
+    ESP_LOGI(TAG, "current timestamp: %lu", now);
+
+    // ensure that message is not being replayed
+    if (abs(now - strtol(timestamp, NULL, 0)) >= 10)
+    {
+        // cleanup
+        cJSON_Delete(bodyRoot);
+
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, NULL);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t ulNotificationValue;
+    // timeout at 10 seconds
+    const TickType_t xMaxBlockTime = pdMS_TO_TICKS(10000);
+
+    xTaskToNotify = xTaskGetCurrentTaskHandle();
+    xTaskCreate(in3_task_verify, "verifyTask", 28048, (void *)bodyRoot, 7, NULL);
+
+    ulNotificationValue = ulTaskNotifyTake(pdTRUE, xMaxBlockTime);
+
     httpd_resp_set_type(req, "application/json");
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "response", "request received successfully, please use the retrieve button after 2 minutes");
+
+    /* At this point xTaskToNotify should be NULL as no transmission
+    is in progress.  A mutex can be used to guard access to the
+    peripheral if necessary. */
+    //configASSERT(xTaskToNotify == NULL);
+
+    /* Store the handle of the calling task. */
+    //xTaskToNotify = xTaskGetCurrentTaskHandle();
+
+    // trigger freertos task to process in3 calls and cache the result in
+    //xTaskCreate(in3_task_get_tx, "getTxTask", 28048, tx_hash, 7, NULL);
+
+    /* Wait to be notified that the transmission is complete.  Note the first
+    parameter is pdTRUE, which has the effect of clearing the task's notification
+    value back to 0, making the notification value act like a binary (rather than
+    a counting) semaphore.  */
+    //ulNotificationValue = ulTaskNotifyTake(pdTRUE,
+    //                                      xMaxBlockTime);
+
+    // ulNotificationValue = 0;
+
+    // ESP_LOGI(REST_TAG, "access granted: %" PRIu32 "\n", ulNotificationValue);
+
+    if (ulNotificationValue == 1 && tx)
+    {
+        /* The transmission ended as expected. */
+        cJSON_AddStringToObject(root, "response", "success");
+        // cJSON_AddNumberToObject(root, "block_number", tx->block_number);
+
+        // char *from_hex = (char *)malloc(20 * sizeof(char) + 1);
+        // //char *from_hex;
+        // bytes_to_hex(tx->from, sizeof(tx->from) + 1, from_hex);
+        // ESP_LOGI(TAG, "from: %s", from_hex);
+
+        //free(*from_hex);
+        //free(tx);
+    }
+    else
+    {
+        /* The call to ulTaskNotifyTake() timed out. */
+        cJSON_AddStringToObject(root, "response", "failed");
+    }
+
     const char *slock_ret = cJSON_Print(root);
     httpd_resp_sendstr(req, slock_ret);
+
+    // cleanup resources
     free((void *)slock_ret);
     cJSON_Delete(root);
+    cJSON_Delete(bodyRoot);
     return ESP_OK;
 }
 
@@ -218,7 +384,7 @@ esp_err_t start_rest_server(void)
         /* URI handler for fetching system info */
         httpd_uri_t exec_uri = {
             .uri = "/api/access",
-            .method = HTTP_GET,
+            .method = HTTP_POST,
             .handler = exec_get_handler,
             .user_ctx = NULL};
         httpd_register_uri_handler(server, &exec_uri);
@@ -236,13 +402,14 @@ esp_err_t start_rest_server(void)
  * In3 Setup and usage
  * **/
 /* Perform in3 requests for http transport */
-static in3_ret_t transport_esphttp(in3_request_t* req)
+static in3_ret_t transport_esphttp(in3_request_t *req)
 {
     ESP_LOGI(REST_TAG, "in 3 transport");
-    
-    for (int i = 0; i < req->urls_len; i++){
+
+    for (int i = 0; i < req->urls_len; i++)
+    {
         ESP_LOGI(REST_TAG, "url:%s \n payload:%s \n", req->urls[i], req->payload);
-        send_request( req->urls[i], req->payload);
+        send_request(req->urls[i], req->payload);
         sb_add_range(&req->results[i].result, http_in3_buffer->data, 0, http_in3_buffer->len);
     }
     return 0;
@@ -252,15 +419,20 @@ void init_in3(void)
 {
     in3_log_set_quiet(false);
     in3_log_set_level(LOG_TRACE);
-    // in3_register_eth_full();
+    in3_register_eth_basic();
     // init in3
-    c = in3_for_chain(ETH_CHAIN_ID_GOERLI);
+    c = in3_for_chain(ETH_CHAIN_ID_KOVAN);
     c->transport = transport_esphttp; // use esp_idf_http client to handle the requests
-    c->request_count = 1;           // number of requests to sendp
+    c->request_count = 1;             // number of requests to sendp
     //c->use_binary = 1;
-    // c->proof = PROOF_FULL;
+    c->proof = PROOF_STANDARD;
     c->max_attempts = 1;
-    c->flags         = FLAGS_STATS | FLAGS_INCLUDE_CODE; // no autoupdate nodelist
-    for (int i = 0; i < c->chains_length; i++) c->chains[i].nodelist_upd8_params = NULL;
-}
+    //c->flags         = FLAGS_STATS | FLAGS_INCLUDE_CODE; // no autoupdate nodelist
+    c->flags = FLAGS_AUTO_UPDATE_LIST;
+    //for (int i = 0; i < c->chains_length; i++) c->chains[i].nodelist_upd8_params = NULL;
 
+    // setup time synchronization
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_init();
+}

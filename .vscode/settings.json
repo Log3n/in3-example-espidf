@@ -1,0 +1,4 @@
+{
+    "cmake.configureOnOpen": true,
+    "idf.port": "/dev/cu.SLAB_USBtoUART"
+}
